@@ -2,9 +2,119 @@ from mlc import utils
 import os
 import json
 import csv
+import re
 import statistics
 import datetime
+import subprocess
 from utils import is_true
+
+
+def _expand_workload_ids(workload_ids):
+    """Expand comma/space/range workload ID strings into a sorted unique list."""
+    ids = set()
+    for token in re.split(r'[,\s]+', str(workload_ids).strip()):
+        if not token:
+            continue
+        if '-' in token:
+            start, end = token.split('-', 1)
+            if start.isdigit() and end.isdigit():
+                ids.update(range(int(start), int(end) + 1))
+                continue
+        if token.isdigit():
+            ids.add(int(token))
+    return sorted(ids)
+
+
+def _parse_workload_list_output(text):
+    """Parse `geekbench --workload-list` into workload_id -> section_ids."""
+    mapping = {}
+    current_section = None
+    for line in text.splitlines():
+        section_match = re.match(
+            r'^\s*(?:document\.header\.)?section\s+(\d+)\s*:', line, re.I)
+        if section_match:
+            current_section = int(section_match.group(1))
+            continue
+        if not line.startswith('\t'):
+            gb6_section_match = re.match(r'^\s+(\d+)\s*:\s+\S', line)
+            if gb6_section_match:
+                current_section = int(gb6_section_match.group(1))
+                continue
+        workload_match = re.match(r'^\t(\d+)\s*:', line)
+        if workload_match and current_section is not None:
+            workload_id = int(workload_match.group(1))
+            mapping.setdefault(workload_id, set()).add(current_section)
+    return mapping
+
+
+def _allowed_sections_for_workload_type(workload_type):
+    workload_type = str(workload_type).strip().lower()
+    if '--gpu' in workload_type or '--compute' in workload_type:
+        if 'metal' in workload_type:
+            return {7}
+        if any(api in workload_type for api in ('opencl', 'cuda', 'vulkan')):
+            return {4}
+        return {4, 7}
+    return {1, 2, 3}
+
+
+def _resolve_sections_for_workloads(geekbench_bin, workload_ids, env, logger):
+    """Infer --section IDs when --workload is used without --section."""
+    try:
+        proc = subprocess.run(
+            [geekbench_bin, '--workload-list'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        logger.warning(f"Could not run --workload-list to infer sections: {exc}")
+        return ''
+
+    if proc.returncode != 0:
+        logger.warning(
+            "Could not parse --workload-list output to infer sections "
+            f"(exit code {proc.returncode})")
+        return ''
+
+    mapping = _parse_workload_list_output(proc.stdout)
+    if not mapping:
+        logger.warning("Could not parse --workload-list output to infer sections")
+        return ''
+
+    requested_ids = _expand_workload_ids(workload_ids)
+    if not requested_ids:
+        return ''
+
+    allowed_sections = _allowed_sections_for_workload_type(
+        env.get('MLC_GEEKBENCH_WORKLOAD', '--cpu'))
+    explicit_single_core = is_true(env.get('MLC_GEEKBENCH_SINGLE_CORE', ''))
+    explicit_multi_core = is_true(env.get('MLC_GEEKBENCH_MULTI_CORE', ''))
+    if explicit_single_core:
+        allowed_sections &= {1}
+    elif explicit_multi_core:
+        allowed_sections &= {2}
+
+    resolved_sections = set()
+    missing_ids = []
+    for workload_id in requested_ids:
+        sections = mapping.get(workload_id, set()) & allowed_sections
+        if not sections:
+            missing_ids.append(workload_id)
+            continue
+        resolved_sections.update(sections)
+
+    if missing_ids:
+        logger.warning(
+            "Could not infer Geekbench section(s) for workload ID(s): "
+            f"{', '.join(str(wid) for wid in missing_ids)}")
+        return ''
+
+    section_list = ','.join(str(sec) for sec in sorted(resolved_sections))
+    logger.info(
+        f"Inferred Geekbench section(s) {section_list} for workload ID(s) "
+        f"{', '.join(str(wid) for wid in requested_ids)}")
+    return section_list
 
 
 def compute_olympic_score(values):
@@ -229,11 +339,16 @@ def preprocess(i):
 
     # Section filter (Pro: --section IDs)
     section = env.get('MLC_GEEKBENCH_SECTION', '').strip()
+    workload_ids = env.get('MLC_GEEKBENCH_WORKLOAD_IDS', '').strip()
+    if workload_ids and not section:
+        section = _resolve_sections_for_workloads(
+            geekbench_bin, workload_ids, env, logger)
+        if section:
+            env['MLC_GEEKBENCH_SECTION'] = section
     if section:
         args.append(f'--section {section}')
 
     # Workload filter (Pro: --workload IDs, used with --section)
-    workload_ids = env.get('MLC_GEEKBENCH_WORKLOAD_IDS', '').strip()
     if workload_ids:
         args.append(f'--workload {workload_ids}')
 
